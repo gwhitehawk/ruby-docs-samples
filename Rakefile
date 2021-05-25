@@ -12,8 +12,10 @@ def run_tests type
   failed = false
   full_start_time = Time.now
 
+  header "Running on Ruby #{RUBY_VERSION}"
   header "Installing dependencies"
-  each_lib do |_dir|
+  each_lib do |dir|
+    header "Installing bundle in #{dir}"
     sh "bundle update"
   end
 
@@ -28,7 +30,6 @@ def run_tests type
     end
     end_time = Time.now
     header_2 "Tests for #{lib} took #{(end_time - start_time).to_i} seconds"
-    test_task dir, type
   end
 
   full_end_time = Time.now
@@ -47,9 +48,18 @@ def each_lib
   end
 end
 
+def each_gemfile
+  gemfiles = Dir.glob("**/Gemfile") - ["Gemfile"]
+  gemfiles.map! { |gemfile| File.dirname gemfile }.uniq!
+  gemfiles.each do |gemfile|
+    yield gemfile
+  end
+end
+
 def test_task dir, type
   Rake::TestTask.new "#{dir}_#{type}" do |t|
     t.test_files = FileList["#{dir}/#{type}/**/*_test.rb"]
+    t.options = "--junit --junit-filename=#{dir}/sponge_log.xml"
     t.warning = false
   end
   Rake::Task["#{dir}_#{type}"].invoke
@@ -59,7 +69,13 @@ def dirs
   entries = Dir.glob("#{__dir__}/**/*_test.rb").map do |entry|
     File.expand_path "..", File.dirname(entry)
   end
-  entries.uniq
+  entries.uniq!
+  if RUBY_VERSION.start_with? "2.4"
+    entries.delete_if { |dir| dir.include? "/ruby-docs-samples/functions" }
+  elsif !RUBY_VERSION.start_with? "2.7"
+    entries.delete_if { |dir| dir.include? "/ruby-docs-samples/run/rails-cat_album" }
+  end
+  entries
 end
 
 def header str, token = "#"

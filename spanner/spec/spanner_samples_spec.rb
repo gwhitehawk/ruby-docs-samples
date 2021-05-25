@@ -13,31 +13,16 @@
 # limitations under the License.
 
 require_relative "../spanner_samples"
-require "rspec"
-require "google/cloud/spanner"
+require_relative "./spec_helper"
 
 describe "Google Cloud Spanner API samples" do
-  before do
-    if ENV["GOOGLE_CLOUD_SPANNER_TEST_INSTANCE"].nil? || ENV["GOOGLE_CLOUD_SPANNER_PROJECT"].nil?
-      skip "GOOGLE_CLOUD_SPANNER_TEST_INSTANCE and/or GOOGLE_CLOUD_SPANNER_PROJECT not defined"
-    end
-
-    @project_id  = ENV["GOOGLE_CLOUD_SPANNER_PROJECT"]
-    @instance_id = ENV["GOOGLE_CLOUD_SPANNER_TEST_INSTANCE"]
-    @seed        = SecureRandom.hex 8
-    @database_id = "test_db_#{@seed}"
-    @spanner     = Google::Cloud::Spanner.new project: @project_id
-    @instance    = @spanner.instance @instance_id
-  end
-
   before :each do
-    @test_database = @instance.database @database_id
-    @test_database&.drop
+    cleanup_database_resources
   end
 
-  after do
-    @test_database = @instance.database @database_id
-    @test_database&.drop
+  after :each do
+    cleanup_database_resources
+    cleanup_instance_resources
   end
 
   # Creates a temporary database with random ID (will be dropped after test)
@@ -76,6 +61,66 @@ describe "Google Cloud Spanner API samples" do
     @test_database = job.database
   end
 
+  def create_database_with_data
+    database = create_singers_albums_database
+
+    capture do
+      write_using_dml project_id:  @project_id,
+                      instance_id: @instance.instance_id,
+                      database_id: database.database_id
+
+      @test_database = @instance.database @database_id
+    end
+
+    @test_database
+  end
+
+  # Creates or return existing temporary backup with random ID (will be dropped
+  # after test)
+  def create_backup_with_data
+    @test_backup = @instance.backup @backup_id
+
+    return @test_backup if @test_backup
+
+    database = create_singers_albums_database
+
+    capture do
+      write_using_dml project_id:  @project_id,
+                      instance_id: @instance.instance_id,
+                      database_id: database.database_id
+    end
+
+    client = @spanner.client @instance.instance_id, database.database_id
+    version_time = client.execute("SELECT CURRENT_TIMESTAMP() as timestamp").rows.first[:timestamp]
+
+    capture do
+      create_backup project_id:   @project_id,
+                    instance_id:  @instance.instance_id,
+                    database_id:  database.database_id,
+                    backup_id:    @backup_id,
+                    version_time: version_time
+
+      @test_backup = @instance.backup @backup_id
+    end
+
+    @test_backup
+  end
+
+  def restore_database_from_backup
+    backup = create_backup_with_data
+
+    capture do
+      restore_backup project_id:  @project_id,
+                     instance_id: @instance.instance_id,
+                     database_id: @restored_database_id,
+                     backup_id:   backup.backup_id
+
+      @test_database = @instance.database @restored_database_id
+    end
+
+    @test_database
+  end
+
   # Capture and return STDOUT output by block
   def capture
     real_stdout = $stdout
@@ -86,6 +131,22 @@ describe "Google Cloud Spanner API samples" do
     $stdout = real_stdout
   end
   attr_reader :captured_output
+
+  example "create_instance" do
+    @created_instance_id = "rb-test-#{seed}"
+
+    capture do
+      create_instance project_id:  @project_id,
+                      instance_id: @created_instance_id
+    end
+
+    expect(captured_output).to include(
+      "Waiting for create instance operation to complete"
+    )
+    expect(captured_output).to include(
+      "Created instance #{@created_instance_id}"
+    )
+  end
 
   example "create_database" do
     expect(@instance.databases.map(&:database_id)).not_to include @database_id
@@ -112,6 +173,54 @@ describe "Google Cloud Spanner API samples" do
 
     expect(data_definition_statements).to include(match "CREATE TABLE Singers")
     expect(data_definition_statements).to include(match "CREATE TABLE Albums")
+  end
+
+  example "create_database_with_version_retention_period" do
+    expect(@instance.databases.map(&:database_id)).not_to include @database_id
+
+    capture do
+      create_database_with_version_retention_period project_id:  @project_id,
+                                                    instance_id: @instance.instance_id,
+                                                    database_id: @database_id
+    end
+
+    expect(captured_output).to include(
+      "Waiting for create database operation to complete"
+    )
+    expect(captured_output).to include(
+      "Created database #{@database_id} on instance #{@instance.instance_id}"
+    )
+    expect(captured_output).to include(
+      "\tVersion retention period: 7d"
+    )
+
+    @test_database = @instance.database @database_id
+    expect(@test_database).not_to be nil
+
+    data_definition_statements = @test_database.ddl
+
+    expect(data_definition_statements.size).to eq 3
+
+    expect(data_definition_statements).to include(match "CREATE TABLE Singers")
+    expect(data_definition_statements).to include(match "CREATE TABLE Albums")
+    expect(data_definition_statements).to include(match "version_retention_period = '7d'")
+  end
+
+  example "create_database_with_encryption_key" do
+    expect(@instance.databases.map(&:database_id)).not_to include @database_id
+
+    kms_key_name = "projects/#{@project_id}/locations/us-central1/keyRings/spanner-test-keyring/cryptoKeys/spanner-test-cmek"
+
+    capture do
+      create_database_with_encryption_key project_id:  @project_id,
+                                          instance_id: @instance.instance_id,
+                                          database_id: @database_id,
+                                          kms_key_name: kms_key_name
+    end
+
+    expect(captured_output).to include(
+      "Database #{@database_id} created with encryption key #{kms_key_name}"
+    )
   end
 
   example "create table with timestamp column" do
@@ -334,6 +443,35 @@ describe "Google Cloud Spanner API samples" do
     expect(captured_output).to include "2 1 Green"
     expect(captured_output).to include "2 2 Forever Hold Your Peace"
     expect(captured_output).to include "2 3 Terrified"
+  end
+
+  example "delete data" do
+    database = create_singers_albums_database
+
+    # Ignore the following capture block
+    capture do
+      # Insert Singers and Albums (re-use insert_data sample to populate)
+      insert_data project_id:  @project_id,
+                  instance_id: @instance.instance_id,
+                  database_id: database.database_id
+    end
+
+    capture do
+      delete_data project_id:  @project_id,
+                instance_id: @instance.instance_id,
+                database_id: database.database_id
+    end
+
+    capture do
+      read_data project_id:  @project_id,
+                instance_id: @instance.instance_id,
+                database_id: database.database_id
+    end
+
+    client = @spanner.client @instance.instance_id, database.database_id
+
+    expect(client.execute("SELECT * FROM Singers").rows.count).to eq 0
+    expect(client.execute("SELECT * FROM Albums").rows.count).to eq 0
   end
 
   example "read stale data" do
@@ -973,10 +1111,10 @@ describe "Google Cloud Spanner API samples" do
       write_using_dml project_id:  @project_id,
                       instance_id: @instance.instance_id,
                       database_id: database.database_id
-    }.to output("4 records inserted.\n").to_stdout
+    }.to output("14 records inserted.\n").to_stdout
 
     singers = client.execute("SELECT * FROM Singers").rows.to_a
-    expect(singers.count).to eq 9
+    expect(singers.count).to eq 19
     expect(singers.find { |s| s[:FirstName] == "Dylan" }).not_to be nil
 
     expect {
@@ -1074,13 +1212,13 @@ describe "Google Cloud Spanner API samples" do
 
     client = @spanner.client @instance.instance_id, database.database_id
 
-    expect(client.execute("SELECT * FROM Singers").rows.count).to eq 9
+    expect(client.execute("SELECT * FROM Singers").rows.count).to eq 19
 
     expect {
       delete_using_partitioned_dml project_id:  @project_id,
                                    instance_id: @instance.instance_id,
                                    database_id: database.database_id
-    }.to output("4 records deleted.\n").to_stdout
+    }.to output("14 records deleted.\n").to_stdout
 
     singers = client.execute("SELECT * FROM Singers").rows.to_a
     expect(singers.count).to eq 5
@@ -1275,6 +1413,42 @@ describe "Google Cloud Spanner API samples" do
     expect(captured_output).to include "42 Venue 42"
   end
 
+  example "query data with numeric column" do
+    database = create_singers_albums_database
+    create_venues_table
+
+    # Ignore the following capture block
+    capture do
+      write_datatypes_data project_id:  @project_id,
+                            instance_id: @instance.instance_id,
+                            database_id: database.database_id
+    end
+
+    capture do
+      add_numeric_column project_id:  @project_id,
+                         instance_id: @instance.instance_id,
+                         database_id: database.database_id
+    end
+
+    expect(captured_output).to include "Added the Revenue as a numeric column in Venues table"
+
+    capture do
+      update_data_with_numeric_column project_id:  @project_id,
+                                      instance_id: @instance.instance_id,
+                                      database_id: database.database_id
+    end
+
+    expect(captured_output).to include "Updated data"
+
+    capture do
+      query_with_numeric_parameter project_id:  @project_id,
+                                   instance_id: @instance.instance_id,
+                                   database_id: database.database_id
+    end
+
+    expect(captured_output).to include "4 0.35e5"
+  end
+
   example "write data with array types and read" do
     database = create_boxes_database
 
@@ -1337,5 +1511,284 @@ describe "Google Cloud Spanner API samples" do
     expect(captured_output).to include "10.001"
     expect(captured_output).to include "11.1212"
     expect(captured_output).to include "104.4123101"
+  end
+
+  example "create backup" do
+    cleanup_backup_resources
+    database = create_database_with_data
+
+    client = @spanner.client @instance.instance_id, database.database_id
+    version_time = client.execute("SELECT CURRENT_TIMESTAMP() as timestamp").rows.first[:timestamp]
+
+    capture do
+      create_backup project_id:   @project_id,
+                    instance_id:  @instance.instance_id,
+                    database_id:  database.database_id,
+                    backup_id:    @backup_id,
+                    version_time: version_time
+    end
+
+    expect(captured_output).to include(
+      "Backup operation in progress"
+    )
+    expect(captured_output).to match(
+      /Backup #{@backup_id} of size \d+ bytes was created at/
+    )
+    expect(captured_output).to match(
+      /for version of database at/
+    )
+
+    @test_backup = @instance.backup @backup_id
+    expect(@test_backup).not_to be nil
+  end
+
+  example "create backup with encryptio key" do
+    cleanup_backup_resources
+    database = create_database_with_data
+
+    client = @spanner.client @instance.instance_id, database.database_id
+    kms_key_name = "projects/#{@project_id}/locations/us-central1/keyRings/spanner-test-keyring/cryptoKeys/spanner-test-cmek"
+
+    capture do
+      create_backup_with_encryption_key project_id:   @project_id,
+                                        instance_id:  @instance.instance_id,
+                                        database_id:  database.database_id,
+                                        backup_id:    @backup_id,
+                                        kms_key_name: kms_key_name
+    end
+
+    expect(captured_output).to include(
+      "Backup operation in progress"
+    )
+    expect(captured_output).to match(
+      /Backup #{@backup_id} of size \d+ bytes was created at/
+    )
+    expect(captured_output).to match(
+      /using encryption key #{kms_key_name}/
+    )
+
+    @test_backup = @instance.backup @backup_id
+    expect(@test_backup).not_to be nil
+  end
+
+  example "restore backup" do
+    backup = create_backup_with_data
+
+    capture do
+      restore_backup project_id:  @project_id,
+                     instance_id: @instance.instance_id,
+                     database_id: @restored_database_id,
+                     backup_id:   backup.backup_id
+    end
+
+    expect(captured_output).to include(
+      "Waiting for restore backup operation to complete"
+    )
+    expect(captured_output).to match(
+      /Database #{@database_id} was restored to #{@restored_database_id} from backup #{backup.backup_id} with version time/
+    )
+
+    @test_database = @instance.database @restored_database_id
+    expect(@test_database).not_to be nil
+  end
+
+  example "restore database with encryption key" do
+    backup = create_backup_with_data
+    kms_key_name = "projects/#{@project_id}/locations/us-central1/keyRings/spanner-test-keyring/cryptoKeys/spanner-test-cmek"
+
+    capture do
+      restore_database_with_encryption_key project_id:   @project_id,
+                                           instance_id:  @instance.instance_id,
+                                           database_id:  @restored_database_id,
+                                           backup_id:    backup.backup_id,
+                                           kms_key_name: kms_key_name
+    end
+
+    expect(captured_output).to include(
+      "Waiting for restore backup operation to complete"
+    )
+    expect(captured_output).to match(
+      /Database #{@database_id} was restored to #{@restored_database_id} from backup #{backup.backup_id} using encryption key #{kms_key_name}/
+    )
+
+    @test_database = @instance.database @restored_database_id
+    expect(@test_database).not_to be nil
+  end
+
+  example "cancel backup operation" do
+    database = create_database_with_data
+
+    cancel_backup_id = "cancel_#{@backup_id}"
+    capture do
+      create_backup_cancel project_id:  @project_id,
+                           instance_id: @instance.instance_id,
+                           database_id: database.database_id,
+                           backup_id:   cancel_backup_id
+    end
+
+    expect(captured_output).to include(
+      "Backup operation in progress"
+    )
+    expect(captured_output).to include(
+      "#{cancel_backup_id} creation job cancelled"
+    )
+
+    @test_backup = @instance.backup cancel_backup_id
+    expect(@test_backup).to be nil
+  end
+
+  example "list backup operations" do
+    backup = create_backup_with_data
+
+    capture do
+      list_backup_operations project_id:  @project_id,
+                             instance_id: @instance.instance_id,
+                             database_id: @database_id
+    end
+
+    expect(captured_output).to match(
+      /Backup #{backup.backup_id} on database #{@database_id} is \d+% complete/
+    )
+
+    @test_backup = @instance.backup @backup_id
+    expect(@test_backup).not_to be nil
+  end
+
+  example "list database operations" do
+    database = restore_database_from_backup
+
+    capture do
+      list_database_operations project_id:  @project_id,
+                               instance_id: @instance.instance_id
+    end
+
+    expect(captured_output).to match(
+      /List database operations with optimized database filter found \d+ jobs/
+    )
+  end
+
+  example "list backups with various filters" do
+    backup = create_backup_with_data
+
+    capture do
+      list_backups project_id:  @project_id,
+                   instance_id: @instance.instance_id,
+                   backup_id: @backup_id,
+                   database_id: backup.database_id
+    end
+
+    # Segregate each list backup filters output.
+    output_segments = captured_output.split(/(All backups)/)
+                                      .reject(&:empty?)
+                                      .each_slice(2)
+                                      .map(&:join)
+
+    expect(output_segments.shift).to include("All backups", backup.backup_id)
+
+    expect(output_segments.shift).to include(
+      "All backups with backup name containing",
+      "\"#{backup.backup_id}\":\n#{backup.backup_id}"
+    )
+
+    expect(output_segments.shift).to include(
+      "All backups for databases with a name containing",
+      "\"#{backup.database_id}\":\n#{backup.backup_id}"
+    )
+
+    expect(output_segments.shift).to include(
+      "All backups that expire before a timestamp", backup.backup_id
+    )
+    expect(output_segments.shift).to include(
+      "All backups with a size greater than 500 bytes", backup.backup_id
+    )
+    expect(output_segments.shift).to include(
+      "All backups that were created after a timestamp that are also ready",
+      backup.backup_id
+    )
+    expect(output_segments.shift).to include(
+      "All backups with pagination", backup.backup_id
+    )
+
+    @test_backup = @instance.backup @backup_id
+    expect(@test_backup).not_to be nil
+  end
+
+  example "delete backup" do
+    backup = create_backup_with_data
+
+    capture do
+      delete_backup project_id:  @project_id,
+                    instance_id: @instance.instance_id,
+                    backup_id:   backup.backup_id
+    end
+
+    expect(captured_output).to include(
+      "Backup #{backup.backup_id} deleted"
+    )
+
+    @test_backup = @instance.backup @backup_id
+    expect(@test_backup).to be nil
+  end
+
+  example "update backup" do
+    backup = create_backup_with_data
+
+    capture do
+      update_backup project_id:  @project_id,
+                    instance_id: @instance.instance_id,
+                    backup_id:   backup.backup_id
+    end
+
+    expect(captured_output).to include(
+      "Expiration time updated: #{backup.expire_time + 2_592_000}"
+    )
+  end
+
+  example "set custom timeout and retry settings" do
+    database = create_singers_albums_database
+    # Ignore the following capture block
+    capture do
+      # Insert Singers and Albums (re-use insert_data sample to populate)
+      insert_data project_id:  @project_id,
+                  instance_id: @instance.instance_id,
+                  database_id: database.database_id
+    end
+
+    client = @spanner.client @instance.instance_id, database.database_id
+
+    expect(client.execute("SELECT * FROM Singers").rows.count).to eq 5
+
+    expect {
+      set_custom_timeout_and_retry project_id:  @project_id,
+                       instance_id: @instance.instance_id,
+                       database_id: database.database_id
+    }.to output("1 record inserted.\n").to_stdout
+
+    singers = client.execute("SELECT * FROM Singers").rows.to_a
+    expect(singers.count).to eq 6
+    expect(singers.find { |s| s[:FirstName] == "Virginia" }).not_to be nil
+  end
+
+  example "get commit stats" do
+    database = create_singers_albums_database
+
+    capture do
+      insert_data project_id:  @project_id,
+                  instance_id: @instance.instance_id,
+                  database_id: database.database_id
+
+      add_column project_id:  @project_id,
+                 instance_id: @instance.instance_id,
+                 database_id: database.database_id
+    end
+
+
+    capture do
+      commit_stats project_id:  @project_id,
+                   instance_id: @instance.instance_id,
+                   database_id: database.database_id
+    end
+
+    expect(captured_output).to match /Updated data with \d+ mutations/
   end
 end
